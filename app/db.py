@@ -85,6 +85,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             queued_at       TEXT NOT NULL,
             scheduled_at    TEXT,
             completed_at    TEXT,
+            -- Instant at which a dependency REVISION made this job ready
+            -- (blocked -> ready); NULL when readiness does not stem from a
+            -- revision. Read by the batch aging settlement so wait credit
+            -- never covers time before the head job was truly schedulable.
+            ready_at        TEXT,
             batch_id        INTEGER REFERENCES batches(id),
             run_index       INTEGER
         );
@@ -182,3 +187,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # defaults to NULL (unlimited).
     if "budget_gpu_min" not in tenant_cols:
         conn.execute("ALTER TABLE tenants ADD COLUMN budget_gpu_min INTEGER")
+    # Same for jobs.ready_at: databases created before readiness-aware aging
+    # existed get a nullable column; pre-existing jobs default to NULL (their
+    # readiness is derived from queued_at / prerequisite completions).
+    job_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "ready_at" not in job_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN ready_at TEXT")

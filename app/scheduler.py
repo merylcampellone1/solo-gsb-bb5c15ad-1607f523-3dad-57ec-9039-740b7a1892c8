@@ -77,6 +77,15 @@ a later freshly submitted small job starts a clean wait window. Aging lets
 small jobs behind large, high-weight tenants accumulate credit until they
 become affordable, bounding starvation.
 
+The wait is only ever counted from the moment the head-of-line job is
+*truly schedulable* (see "Job dependencies"): the settlement base is the
+later of the tenant's aging checkpoint and the head job's readiness
+instant — its arrival, the LAST prerequisite's completion, or the instant
+a dependency revision unblocked it. A job whose prerequisite completed one
+minute before the batch therefore earns one minute of aging, not the whole
+time it sat queued behind the unfinished prerequisite, even when no batch
+ran meanwhile to advance the checkpoint.
+
 Reproducibility
 ===============
 Tenant visit order is tenant-id ascending, jobs are FIFO per tenant, job ids
@@ -105,10 +114,15 @@ Submission therefore never closes a cycle, but the whole graph is rechecked
 defensively. During a batch, a tenant is visited only when its head-of-line
 job's prerequisites are all COMPLETED; a dependency-blocked head receives
 neither quantum nor aging credit (its aging checkpoint is merely advanced),
-so blocked dependencies can never be farmed into spendable balance. A
-CANCELLED prerequisite can never complete: dependents stay QUEUED forever
-and ``blocked_by`` (on the job object and in ``GET /queue``) reports the
-prerequisite id together with its current status.
+so blocked dependencies can never be farmed into spendable balance. When
+the last prerequisite completes, the dependent's wait is measured from
+that completion instant (``completed_at``), not from its earlier arrival:
+the batch aging settlement floors its base at the head job's readiness
+instant, so a job unlocked just before the batch earns aging only from
+the unlock. A CANCELLED prerequisite can never complete: dependents stay
+QUEUED forever and ``blocked_by`` (on the job object and in
+``GET /queue``) reports the prerequisite id together with its current
+status.
 
 Batch graph submission
 ======================
@@ -156,7 +170,12 @@ revision runs under the same process-wide lock and ``BEGIN IMMEDIATE``
 write-transaction style as batch scheduling, so it is atomic with respect
 to any concurrent batch/preview, and the next preview or committed batch
 already judges the new edges. The job keeps its ``queued_at`` queue
-position and no balance/aging state is touched.
+position and no balance is touched; the revision does maintain the job's
+readiness clock (``jobs.ready_at``) for the aging settlement: a revision
+that makes a blocked job ready stamps the revision instant as the
+readiness moment (the job's wait then counts from there), a revision that
+re-blocks a ready job clears it, and a ready-to-ready revision preserves
+the already-established instant.
 
 Dependency cancel cascade
 =========================
@@ -389,6 +408,42 @@ def _unmet_prerequisites(
         (job_id, COMPLETED),
     ).fetchall()
     return [{"id": r["id"], "status": r["status"]} for r in rows]
+
+
+def _job_ready_since(
+    conn: sqlite3.Connection, job: sqlite3.Row
+) -> datetime:
+    """The instant the job's current readiness period began (aware UTC).
+
+    Only meaningful for a job whose prerequisites are all COMPLETED (a ready
+    head-of-line). A revision-stamped ``ready_at`` is authoritative when
+    present: :func:`revise_dependencies` sets it to the revision instant
+    when a revision releases a blocked job, and to the already-established
+    readiness instant when a ready job stays ready, so it always names the
+    exact moment the current ready period began. Otherwise the job became
+    ready at the later of its arrival (``queued_at`` — it can never be
+    ready before it exists) and the LAST prerequisite's ``completed_at``
+    (a job released by completions became ready exactly when its final
+    prerequisite completed, however long it waited queued before that).
+
+    The batch aging settlement floors its wait base at this instant, so a
+    job unlocked only moments before the batch earns aging credit from the
+    unlock — never from its original arrival — even when no batch ran
+    meanwhile to advance the tenant's aging checkpoint.
+    """
+    if job["ready_at"] is not None:
+        return _as_utc(_parse_iso(job["ready_at"]))
+    ready = _as_utc(_parse_iso(job["queued_at"]))
+    last_completed = conn.execute(
+        """SELECT MAX(j.completed_at) AS ts
+             FROM job_dependencies d
+             JOIN jobs j ON j.id = d.depends_on
+            WHERE d.job_id = ?""",
+        (job["id"],),
+    ).fetchone()["ts"]
+    if last_completed is not None:
+        ready = max(ready, _as_utc(_parse_iso(last_completed)))
+    return ready
 
 
 def _find_cycle(
@@ -1212,9 +1267,18 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         return _get_job_or_404(conn, job_id)
 
 
-def complete_job(job_id: str) -> dict[str, Any]:
-    """Mark a RUNNING job COMPLETED, releasing its GPUs for future batches."""
-    now = _now_iso()
+def complete_job(job_id: str, now: datetime | None = None) -> dict[str, Any]:
+    """Mark a RUNNING job COMPLETED, releasing its GPUs for future batches.
+
+    The completion instant (``completed_at``) doubles as the readiness
+    release for dependency-blocked successors: a dependent whose every
+    prerequisite is COMPLETED becomes truly ready at the LAST such
+    completion, and the next batch's aging settlement counts its wait from
+    that instant — never from its earlier arrival — whether or not any
+    batch ran meanwhile. ``now`` is injectable for deterministic testing,
+    exactly as with :func:`run_batch`.
+    """
+    now_str = _now_iso(_as_utc(now)) if now is not None else _now_iso()
     with db.get_lock(), db.get_conn():
         conn = db.get_conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -1228,7 +1292,7 @@ def complete_job(job_id: str) -> dict[str, Any]:
             )
         conn.execute(
             "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
-            (COMPLETED, now, job_id),
+            (COMPLETED, now_str, job_id),
         )
         return _get_job_or_404(conn, job_id)
 
@@ -1236,6 +1300,7 @@ def complete_job(job_id: str) -> dict[str, Any]:
 def revise_dependencies(
     job_id: str,
     depends_on: list[str] | None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Atomically replace a QUEUED job's prerequisite set.
 
@@ -1252,10 +1317,24 @@ def revise_dependencies(
     transaction style as batch scheduling, so the revision is atomic with
     respect to any concurrent batch/preview and the next preview or
     committed batch already judges the new edges. The job keeps its
-    ``queued_at`` queue position; no balance or aging state is touched, and
-    the submission-time idempotency fingerprint (if any) is preserved — a
+    ``queued_at`` queue position and no balance is touched. The revision
+    does maintain the job's readiness clock (``jobs.ready_at``) that the
+    batch aging settlement floors its wait base at:
+
+    * blocked -> ready: the revision itself released the job, so its wait
+      counts from the revision instant (``ready_at = now``), never from
+      its earlier arrival;
+    * ready -> blocked: ``ready_at`` is cleared (a later completion or
+      revision starts a fresh readiness period);
+    * ready -> ready: the already-established readiness instant is
+      preserved, so replacing satisfied prerequisites cannot move the
+      readiness moment backwards.
+
+    The submission-time idempotency fingerprint (if any) is preserved — a
     replay of the original ``POST /jobs`` request returns this job's
-    current object without restoring the original edges.
+    current object without restoring the original edges. ``now`` is
+    injectable for deterministic testing, exactly as with
+    :func:`run_batch`.
     """
     if depends_on is None:
         depends_on = []
@@ -1267,12 +1346,13 @@ def revise_dependencies(
         )
     # The same normalised form as submission: deduplicated, sorted by id.
     depends_on = sorted(set(depends_on))
+    now_str = _now_iso(_as_utc(now)) if now is not None else _now_iso()
 
     with db.get_lock(), db.get_conn():
         conn = db.get_conn()
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            "SELECT * FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
         if row is None:
             raise NotFound(f"job '{job_id}' not found")
@@ -1311,6 +1391,12 @@ def revise_dependencies(
                 "dependency cycle detected: " + " -> ".join(cycle)
             )
 
+        # Readiness around the replacement, for the aging readiness clock.
+        was_ready = not _unmet_prerequisites(conn, job_id)
+        ready_since_before = (
+            _job_ready_since(conn, row) if was_ready else None
+        )
+
         conn.execute(
             "DELETE FROM job_dependencies WHERE job_id = ?", (job_id,)
         )
@@ -1318,6 +1404,25 @@ def revise_dependencies(
             conn.execute(
                 "INSERT INTO job_dependencies (job_id, depends_on) VALUES (?, ?)",
                 (job_id, prereq),
+            )
+
+        is_ready = not _unmet_prerequisites(conn, job_id)
+        if is_ready and not was_ready:
+            # The revision itself released the job: its wait counts from
+            # this instant, not from its earlier arrival.
+            ready_at = now_str
+        elif was_ready and not is_ready:
+            ready_at = None
+        elif was_ready and is_ready:
+            # Continuously ready: pin the established instant so the
+            # replacement cannot move readiness backwards.
+            ready_at = ready_since_before.isoformat()
+        else:
+            ready_at = row["ready_at"]
+        if ready_at != row["ready_at"]:
+            conn.execute(
+                "UPDATE jobs SET ready_at = ? WHERE id = ?",
+                (ready_at, job_id),
             )
         return _get_job_or_404(conn, job_id)
 
@@ -1962,13 +2067,17 @@ def _batch_tx_body(
     # Aging is settled even when the cluster is full, so waiting tenants
     # keep accumulating starvation compensation across blocked batches.
     # --- Aging settlement at batch start -------------------------------
-    # Compensation covers the full wait since the oldest queued job's
-    # arrival: on first observation we settle from queued_at, afterwards
-    # from the previous settlement instant. Same-instant retries grant
-    # nothing, so the endpoint cannot be farmed via aging either.
-    # Dependency-blocked tenants receive nothing, but their checkpoint is
-    # advanced: once dependencies release them, waiting is measured from
-    # the release point rather than the original submission.
+    # Compensation covers the wait since the tenant's aging checkpoint: on
+    # first observation we settle from the oldest queued job's arrival,
+    # afterwards from the previous settlement instant. Same-instant retries
+    # grant nothing, so the endpoint cannot be farmed via aging either.
+    # The base is additionally floored at the head job's readiness instant
+    # (_job_ready_since): a job released by a prerequisite completion or by
+    # a dependency revision earns credit only from that release, never from
+    # its earlier arrival — even when no batch ran meanwhile to advance the
+    # checkpoint. Dependency-blocked tenants receive nothing, but their
+    # checkpoint is advanced: once dependencies release them, waiting is
+    # measured from the release point rather than the original submission.
     for t in active:
         if t["tenant_id"] not in ready_at_start:
             conn.execute(
@@ -1983,9 +2092,15 @@ def _batch_tx_body(
             (t["tenant_id"], QUEUED),
         ).fetchone()["ts"]
         base = t["aging_settled_at"] or oldest
-        waited_min = (
-            _parse_iso(now_str) - _parse_iso(base)
-        ).total_seconds() / 60.0
+        # The wait is never counted from before the head job became truly
+        # schedulable: take the later of the existing aging checkpoint and
+        # the head's readiness instant (last prerequisite completion,
+        # unblocking dependency revision, or arrival).
+        base_dt = _as_utc(_parse_iso(base))
+        ready_dt = _job_ready_since(conn, head_of(t["tenant_id"]))
+        if ready_dt > base_dt:
+            base_dt = ready_dt
+        waited_min = (now_dt - base_dt).total_seconds() / 60.0
         if waited_min < 0:
             waited_min = 0.0
         bonus = settings.aging_rate_gpu_min_per_min * waited_min
