@@ -86,7 +86,13 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             scheduled_at    TEXT,
             completed_at    TEXT,
             batch_id        INTEGER REFERENCES batches(id),
-            run_index       INTEGER
+            run_index       INTEGER,
+            -- Moment the job last became dependency-ready when that moment
+            -- was a dependency revision (set by PATCH .../dependencies when
+            -- it unblocks the job, cleared when a revision blocks it).
+            -- NULL otherwise: readiness is then derived from queued_at and
+            -- the prerequisites' completed_at at aging-settlement time.
+            ready_since     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status
@@ -182,3 +188,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # defaults to NULL (unlimited).
     if "budget_gpu_min" not in tenant_cols:
         conn.execute("ALTER TABLE tenants ADD COLUMN budget_gpu_min INTEGER")
+    # Same for the dependency-readiness clock on jobs: databases created
+    # before readiness-aware aging existed get a nullable column. NULL is the
+    # correct default for every pre-existing job: readiness is then derived
+    # from queued_at and the prerequisites' completed_at, which is exact for
+    # any job a revision never unblocked.
+    job_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "ready_since" not in job_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN ready_since TEXT")

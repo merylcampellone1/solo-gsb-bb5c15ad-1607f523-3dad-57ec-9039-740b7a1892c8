@@ -594,6 +594,65 @@ def main() -> int:
             raise AssertionError("cancelled target should 409")
     print("case 14 dependency cancel cascade OK")
 
+    # --- Case 15: aging accrues only from true head readiness -------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    pre = submit("a", 1, 10, 1.0, iso(0))
+    dep = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[pre["id"]])
+    db.get_conn().execute(
+        "UPDATE jobs SET queued_at = ? WHERE id = ?", (iso(0), dep["id"]))
+    # The prerequisite completes one minute before the batch and no batch
+    # ran in between: the dependent waited 60 min since arrival, but only
+    # the single truly-ready minute earns aging credit.
+    db.get_conn().execute(
+        "UPDATE jobs SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+        (iso(59), pre["id"]))
+    r = scheduler.run_batch(now=at(60))
+    assert r["selection_order"] == [dep["id"]]
+    aging = [e for e in r["events"]
+             if e["kind"] == "AGING" and e["tenant_id"] == "b"]
+    assert len(aging) == 1 and abs(aging[0]["amount"] - 1.0) < 1e-9, aging
+
+    # Several prerequisites: the LAST completion releases the job.
+    db.reset_for_tests()
+    db.connect(":memory:")
+    p1 = submit("a", 1, 5, 1.0, iso(0))
+    p2 = submit("a", 1, 5, 1.0, iso(0))
+    dep = scheduler.submit_job("b", 1, 5, 1.0, depends_on=[p1["id"], p2["id"]])
+    db.get_conn().execute(
+        "UPDATE jobs SET queued_at = ? WHERE id = ?", (iso(0), dep["id"]))
+    for jid, ts in ((p1["id"], iso(10)), (p2["id"], iso(50))):
+        db.get_conn().execute(
+            "UPDATE jobs SET status = 'COMPLETED', completed_at = ? "
+            "WHERE id = ?", (ts, jid))
+    r = scheduler.run_batch(now=at(60))
+    aging = [e for e in r["events"]
+             if e["kind"] == "AGING" and e["tenant_id"] == "b"]
+    assert len(aging) == 1 and abs(aging[0]["amount"] - 10.0) < 1e-9, aging
+
+    # A dependency revision that unblocks the head starts the clock at the
+    # revision instant; the preview agrees with the committed batch and
+    # persists nothing.
+    db.reset_for_tests()
+    db.connect(":memory:")
+    pre = submit("a", 1, 5, 1.0, iso(0))
+    dep = scheduler.submit_job("b", 1, 5, 1.0, depends_on=[pre["id"]])
+    db.get_conn().execute(
+        "UPDATE jobs SET queued_at = ? WHERE id = ?", (iso(0), dep["id"]))
+    t_rev = datetime.now(timezone.utc)
+    scheduler.revise_dependencies(dep["id"], [])
+    ref = t_rev + timedelta(minutes=1)
+    p = scheduler.preview_batch(now=ref)
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM ledger").fetchone()["n"] == 0
+    r = scheduler.run_batch(now=ref)
+    aging = [e for e in r["events"]
+             if e["kind"] == "AGING" and e["tenant_id"] == "b"]
+    assert len(aging) == 1 and abs(aging[0]["amount"] - 1.0) < 0.01, aging
+    assert [(e["kind"], e["amount"]) for e in p["events"]] == [
+        (e["kind"], e["amount"]) for e in r["events"]]
+    print("case 15 readiness-aware aging OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 
